@@ -20,6 +20,7 @@ from requests.exceptions import RequestException, SSLError, ProxyError
 from matplotlib.ticker import FuncFormatter
 import html
 import io
+from io import BytesIO
 import argparse
 
 # ===================== НАСТРОЙКИ =====================
@@ -40,20 +41,20 @@ PROXY_HTTP_URL = "http://mm4pkP:a6K4yx@95.181.155.167:8000"
 PROXY_HTTP_ALT = "http://lte6:LVxqnyQiMH@65.109.79.15:13014"
 
 # Поведение запросов
-REQUEST_DELAY = 9.0
-JITTER = 1.0
-MAX_RETRIES = 3
+REQUEST_DELAY = 8.5
+JITTER = 1.5
+MAX_RETRIES = 2
 MAX_RETRIES_429 = 4
 BACKOFF_BASE = 2.0
 
 # Фильтры
-VOLATILITY_THRESHOLD = 9.0
+VOLATILITY_THRESHOLD = 8.0
 PRICE_CHANGE_THRESHOLD = 8.0
 BREAKOUT_THRESHOLD = 2.0
-MIN_PRICE = 3.0
+MIN_PRICE = 2.0
 MIN_VOLUME_24H = 1
 HISTORY_DAYS = 7
-USD_RATE = 83.4
+USD_RATE = 83.4  # Fallback значение
 
 # Папка для CSV/PNG
 OUT_DIR = "out"
@@ -69,6 +70,20 @@ ALLOW_INSECURE = False
 
 # Лог
 LOG_FILE = "posted_items.json"
+
+# ===================== ФУНКЦИЯ ПОЛУЧЕНИЯ КУРСА USD/RUB =====================
+def get_usd_to_rub_rate():
+    url = "https://www.cbr-xml-daily.ru/daily_json.js"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        usd_rate = data['Valute']['USD']['Value']
+        print(f"[USD_RATE] Актуальный курс USD/RUB: {usd_rate:.2f} (по данным ЦБ РФ)")
+        return usd_rate
+    except Exception as e:
+        print(f"[USD_RATE] Ошибка при получении курса: {e}. Используется fallback: {USD_RATE}")
+        return USD_RATE  # Fallback на константу
 
 # ===================== Сессия requests =====================
 session = requests.Session()
@@ -249,6 +264,47 @@ def build_market_hash_name(item: dict) -> str:
         name = f"Souvenir {name}"
     return name
 
+def parse_order_table(soup: BeautifulSoup, table_id: str) -> List[List[float]]:
+    div = soup.find("div", {"id": table_id})
+    if not div:
+        return []
+    rows = div.find_all("tr")[1:]  # skip header
+    price_qty = []
+    for row in rows:
+        tds = row.find_all("td")
+        if len(tds) != 2:
+            continue
+        price_text = tds[0].text.strip()
+        qty_text = tds[1].text.strip()
+        # parse price
+        if 'и ' in price_text:
+            m = re.match(r'(.+?)( руб\. и)', price_text)
+            if m:
+                price_str = m.group(1).replace(',', '.').strip()
+            else:
+                price_str = price_text.replace(' руб.', '').replace(',', '.').strip()
+        else:
+            price_str = price_text.replace(' руб.', '').replace(',', '.').strip()
+        try:
+            price = float(price_str)
+        except ValueError:
+            continue
+        try:
+            qty = int(re.sub(r'[^\d]', '', qty_text))
+        except ValueError:
+            qty = 0
+        if qty > 0:
+            price_qty.append([price, qty])
+    # sort asc by price
+    price_qty.sort(key=lambda x: x[0])
+    # compute cumulative
+    graph = []
+    cumul = 0
+    for p, q in price_qty:
+        cumul += q
+        graph.append([p, float(cumul)])  # float for plot
+    return graph
+
 # ===================== ПОЛУЧЕНИЕ ИСТОРИИ ЦЕН И ДРУГИХ ДАННЫХ =====================
 def get_item_data(market_hash_name: str) -> Dict[str, Any]:
     encoded = quote(market_hash_name, safe='')
@@ -257,7 +313,7 @@ def get_item_data(market_hash_name: str) -> Dict[str, Any]:
     r = request_with_retries(url, headers=headers, timeout=20)
     if not r or r.status_code != 200:
         print(f"[item_data] Не удалось загрузить страницу для {market_hash_name}")
-        return {"history": [], "sell_listings": 0, "buy_orders": 0, "total_listings": 0, "price_usd": 0.0, "image_url": ""}
+        return {"history": [], "sell_listings": 0, "buy_orders": 0, "total_listings": 0, "price_usd": 0.0, "image_url": "", "histogram": None}
 
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -312,90 +368,57 @@ def get_item_data(market_hash_name: str) -> Dict[str, Any]:
             if total_span:
                 total_listings = int(total_span.text.strip())
 
-    # Парсинг buy_orders
-    buy_orders = 0
-    buy_requests_div = soup.find("div", id="market_commodity_buyrequests")
-    if buy_requests_div:
-        promote_span = buy_requests_div.find("span", class_="market_commodity_orders_header_promote")
-        if promote_span:
-            buy_text = promote_span.text.strip().replace(',', '')
-            buy_match = re.search(r'(\d+)', buy_text)
-            if buy_match:
-                buy_orders = int(buy_match.group(1))
-                print(f"[parse] Запросов на покупку: {buy_orders}")
-            else:
-                print("[parse] Не удалось извлечь число из promote_span:", promote_span.text)
-        else:
-            print("[parse] Не найден promote_span в market_commodity_buyrequests")
-            buy_text_match = re.search(r'Запросов на покупку:\s*(\d+)', buy_requests_div.text)
-            if buy_text_match:
-                buy_orders = int(buy_text_match.group(1))
-                print(f"[parse] Запросов на покупку (альтернативный метод): {buy_orders}")
-            else:
-                print("[parse] Не удалось найти Запросов на покупку в тексте div")
-    else:
-        print("[parse] Не найден div market_commodity_buyrequests")
+    # Парсинг таблиц ордеров (основной метод)
+    sell_graph = parse_order_table(soup, "market_commodity_forsale_table")
+    buy_graph = parse_order_table(soup, "market_commodity_buyreqeusts_table")
+    sell_listings = float(sell_graph[-1][1]) if sell_graph else 0
+    buy_orders = float(buy_graph[-1][1]) if buy_graph else 0
 
-    # Парсинг sell_listings
-    sell_listings = total_listings
-    orders_header = soup.find("div", id="market_commodity_orders_header")
-    if orders_header:
-        promote_spans = orders_header.find_all("span", class_=re.compile(".*promote.*"))
-        if len(promote_spans) >= 2:
-            try:
-                sell_text = promote_spans[1].text.strip().replace(',', '')
-                sell_match = re.search(r'(\d+)', sell_text)
-                if sell_match:
-                    sell_listings = int(sell_match.group(1))
-            except ValueError:
-                print("[parse] Ошибка парсинга чисел sell")
-        else:
-            sell_text = soup.find(text=re.compile(r'sell listings?', re.I))
-            if sell_text:
-                sell_match = re.search(r'(\d+)', str(sell_text.parent))
-                if sell_match:
-                    sell_listings = int(sell_match.group(1))
-    else:
-        print("[parse] Не найден orders_header div для sell_listings")
+    # Fallback к API, если таблицы пустые
+    if not sell_graph or not buy_graph:
+        print(f"[parse] Таблицы пустые для {market_hash_name}, fallback к API histogram")
+        scripts = soup.find_all("script")
+        item_nameid = None
         for script in scripts:
             text = script.string
             if text:
-                m_hist = re.search(r'var\s+g_rgOrderHistogram\s*=\s*(\[.*?\]);', text, re.DOTALL)
-                if m_hist:
-                    hist = safe_json_loads(m_hist.group(1))
-                    if hist:
-                        if len(hist) >= 2:
-                            buy_orders = sum(hist[0]) if isinstance(hist[0], list) else hist[0]
-                            sell_listings = sum(hist[1]) if isinstance(hist[1], list) else hist[1]
-                            print(f"[parse] Из orders_histogram: buy={buy_orders}, sell={sell_listings}")
-                            break
-
-    # Альтернативный метод через histogram
-    scripts = soup.find_all("script")
-    item_nameid = None
-    for script in scripts:
-        text = script.string
-        if text:
-            m = re.search(r'Market_LoadOrderSpread\(\s*(\d+)\s*\)', text)
-            if m:
-                item_nameid = m.group(1)
-                break
-
-    if item_nameid:
-        histogram_url = f"https://steamcommunity.com/market/itemordershistogram?country=RU&language=russian&currency=5&item_nameid={item_nameid}&two_factor=0&norender=1"
-        r_hist = request_with_retries(histogram_url, timeout=20)
-        if r_hist and r_hist.status_code == 200:
-            j = r_hist.json()
-            if 'success' in j and j['success'] == 1:
-                buy_orders = j.get('buy_order_count', 0)
-                sell_listings = j.get('sell_order_count', 0)
-                print(f"[parse] From histogram: buy={buy_orders}, sell={sell_listings}")
+                m = re.search(r'Market_LoadOrderSpread\(\s*(\d+)\s*\)', text)
+                if m:
+                    item_nameid = m.group(1)
+                    break
+        histogram = None
+        if item_nameid:
+            histogram_url = f"https://steamcommunity.com/market/itemordershistogram?country=RU&language=russian&currency=5&item_nameid={item_nameid}&two_factor=0&norender=1"
+            r_hist = request_with_retries(histogram_url, timeout=20)
+            if r_hist and r_hist.status_code == 200:
+                j = r_hist.json()
+                if 'success' in j and j['success'] == 1:
+                    buy_orders = j.get('buy_order_count', buy_orders)
+                    sell_listings = j.get('sell_order_count', sell_listings)
+                    histogram = j
+                    print(f"[parse] Fallback API: buy={buy_orders}, sell={sell_listings}")
+                else:
+                    print("[parse] API success=0")
             else:
-                print("[parse] Histogram JSON success=0")
-        else:
-            print("[parse] Failed to load histogram")
+                print("[parse] Failed to load API histogram")
+
+    # Если fallback не сработал, histogram=None
+    if 'buy_order_graph' not in locals() or not locals().get('buy_order_graph'):
+        histogram = locals().get('histogram', None)
     else:
-        print("[parse] item_nameid not found")
+        # Из таблиц
+        all_prices = [p for p, c in sell_graph + buy_graph]
+        all_cumuls = [c for p, c in sell_graph + buy_graph]
+        min_x = min(all_prices) if all_prices else 0
+        max_x = max(all_prices) if all_prices else 0
+        max_y = max(all_cumuls) if all_cumuls else 0
+        histogram = {
+            "buy_order_graph": buy_graph,
+            "sell_order_graph": sell_graph,
+            "graph_min_x": min_x,
+            "graph_max_x": max_x,
+            "graph_max_y": max_y
+        }
 
     # Парсинг lowest price
     price_span = soup.find("span", class_="market_listing_price market_listing_price_with_fee")
@@ -418,7 +441,8 @@ def get_item_data(market_hash_name: str) -> Dict[str, Any]:
         "buy_orders": buy_orders,
         "total_listings": total_listings,
         "price_usd": price_usd,
-        "image_url": image_url
+        "image_url": image_url,
+        "histogram": histogram
     }
 
 # ===================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====================
@@ -456,7 +480,7 @@ def parse_volume(s):
     except ValueError:
         return 0
 
-def df_from_pricehistory(prices_raw):
+def df_from_pricehistory(prices_raw, usd_rate: float = USD_RATE):
     print("[df_from_pricehistory] Начало обработки истории цен: всего записей", len(prices_raw))
     rows = []
     now = datetime.now(tz=TZ)
@@ -490,7 +514,7 @@ def df_from_pricehistory(prices_raw):
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values("timestamp").reset_index(drop=True)
-        df["price_rub"] = df["price_usd"] * USD_RATE
+        df["price_rub"] = df["price_usd"] * usd_rate
     print("[df_from_pricehistory] Сформирован DataFrame с", len(df), "строками (пропущено", skipped_old, "старых записей)")
     return df
 
@@ -580,7 +604,7 @@ def item_passes_criteria(item: dict) -> tuple[bool, str]:
     return False, reason
 
 def create_empty_buf():
-    buf = io.BytesIO()
+    buf = BytesIO()
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.set_facecolor('#1b2838')
     fig.patch.set_facecolor('#1b2838')
@@ -616,7 +640,7 @@ def plot_price_week(df: pd.DataFrame, title: str):
     fig.patch.set_facecolor('#1b2838')
     ax.set_facecolor('#1b2838')
     plt.tight_layout()
-    buf = io.BytesIO()
+    buf = BytesIO()
     fig.savefig(buf, format="png", dpi=120, facecolor='#1b2838', edgecolor='none')
     plt.close(fig)
     buf.seek(0)
@@ -641,11 +665,59 @@ def plot_volume_week(df: pd.DataFrame, title: str):
     fig.patch.set_facecolor('#1b2838')
     ax.set_facecolor('#1b2838')
     plt.tight_layout()
-    buf = io.BytesIO()
+    buf = BytesIO()
     fig.savefig(buf, format="png", dpi=120, facecolor='#1b2838', edgecolor='none')
     plt.close(fig)
     buf.seek(0)
     return buf
+
+def build_plots(item: dict, days: int = HISTORY_DAYS) -> tuple[BytesIO, BytesIO, BytesIO]:
+    print(f"Построение графиков для предмета: {item['name']} (days={days})")
+    df = df_from_pricehistory(item.get("history_raw", []), item.get("usd_rate", USD_RATE))
+    price_buf = plot_price_week(df, f"Динамика цены за {days} дней — {item['name']}")
+    volume_buf = plot_volume_week(df, f"Объём продаж за {days} дней — {item['name']}")
+    histogram = item.get("histogram")
+    if not histogram or not histogram.get("buy_order_graph") or not histogram.get("sell_order_graph"):
+        print(f"Нет данных для графика ордеров для {item['name']}. Создаю пустой буфер.")
+        order_buf = create_empty_buf()
+    else:
+        print(f"Построение графика ордеров для {item['name']}")
+        fig_order, ax_order = plt.subplots(figsize=(10, 4))
+        fig_order.patch.set_facecolor('#1b2838')
+        ax_order.set_facecolor('#1b2838')
+        ax_order.set_title(f"Книга ордеров — {item['name']}", fontsize=10, color='#fff', pad=10)
+        
+        # Buy orders (зелёный, asc prices, increasing cumul)
+        buy_graph = histogram["buy_order_graph"]
+        buy_prices = [row[0] for row in buy_graph]
+        buy_cumuls = [row[1] for row in buy_graph]
+        ax_order.fill_between(buy_prices, 0, buy_cumuls, step='post', color='#00FF00', alpha=0.5)
+        ax_order.plot(buy_prices, buy_cumuls, color='#00FF00', drawstyle='steps-post', linewidth=1.5, label='Запросов на покупку (Зелёный)')
+        
+        # Sell orders (красный, asc prices, increasing cumul)
+        sell_graph = histogram["sell_order_graph"]
+        sell_prices = [row[0] for row in sell_graph]
+        sell_cumuls = [row[1] for row in sell_graph]
+        ax_order.fill_between(sell_prices, 0, sell_cumuls, step='post', color='#FF0000', alpha=0.5)
+        ax_order.plot(sell_prices, sell_cumuls, color='#FF0000', drawstyle='steps-post', linewidth=1.5, label='Лотов на продажу (Красный)')
+        
+        ax_order.set_ylabel("Количество", fontsize=8, color='#ccc')
+        ax_order.set_xlabel("Цена (₽)", fontsize=8, color='#ccc')
+        ax_order.grid(True, linestyle="--", alpha=0.2, color='#555')
+        ax_order.tick_params(colors='#ccc')
+        ax_order.tick_params(axis='x', labelrotation=45)
+        if "graph_min_x" in histogram and "graph_max_x" in histogram:
+            ax_order.set_xlim(histogram["graph_min_x"], histogram["graph_max_x"])
+        if "graph_max_y" in histogram:
+            ax_order.set_ylim(0, histogram["graph_max_y"] * 1.2)
+        ax_order.legend(loc='upper left', fontsize=8, facecolor='#1b2838', edgecolor='#ccc', labelcolor='#ccc')
+        order_buf = BytesIO()
+        fig_order.savefig(order_buf, format="png", dpi=120, facecolor='#1b2838', edgecolor='none')
+        plt.close(fig_order)
+        order_buf.seek(0)
+        print(f"График ордеров создан для {item['name']}")
+    print(f"Графики построены для предмета: {item['name']}")
+    return price_buf, volume_buf, order_buf
 
 def send_media_group_telegram(media_files, caption=""):
     send_url = f"https://api.telegram.org/bot{TOKEN}/sendMediaGroup"
@@ -757,11 +829,14 @@ def generate_daily_summary(items_analyzed: List[Dict], posted_log: List[str]):
 
 # ===================== MAIN =====================
 def main():
-    global USE_PROXY
+    global USD_RATE, USE_PROXY
     parser = argparse.ArgumentParser(description="CSGO Market Analyzer")
     parser.add_argument('--send-summary', action='store_true', help="Send daily summary of top growth and decline items")
     parser.add_argument('--summary-time', type=str, default=DEFAULT_SUMMARY_TIME, help="Time to send summary in HH:MM format (EEST), e.g., '16:39'")
     args = parser.parse_args()
+
+    # Обновляем курс USD/RUB динамически
+    USD_RATE = get_usd_to_rub_rate()
 
     # Проверка формата времени
     try:
@@ -879,7 +954,7 @@ def main():
                     print(f"[main] Нет истории для {mhn}")
                     continue
 
-                df = df_from_pricehistory(raw_history)
+                df = df_from_pricehistory(raw_history, USD_RATE)
                 if df.empty:
                     print(f"[main] Не удалось создать DF для {mhn}")
                     continue
@@ -896,6 +971,9 @@ def main():
                 item["price_usd"] = data["price_usd"] if data["price_usd"] > 0 else current_price_usd
                 item["price_rub"] = item["price_usd"] * USD_RATE
                 item["volume_24h"] = volume_24h
+                item["history_raw"] = raw_history  # Для build_plots
+                item["histogram"] = data.get("histogram")  # Для графика ордеров
+                item["usd_rate"] = USD_RATE  # Передаём в item для графиков
 
                 fallback_image = item.get('image', '')
                 if fallback_image.startswith('http'):
@@ -936,8 +1014,8 @@ def main():
                 df.to_csv(csv_name, index=False, encoding="utf-8")
                 print(f"[main] Сохранён CSV: {csv_name}")
 
-                price_buf = plot_price_week(df, f"Динамика цены за {HISTORY_DAYS} дней — {item['name']}")
-                volume_buf = plot_volume_week(df, f"Объём продаж за {HISTORY_DAYS} дней — {item['name']}")
+                # Построение всех трёх графиков
+                price_buf, volume_buf, order_buf = build_plots(item, HISTORY_DAYS)
 
                 steam_url = f"https://steamcommunity.com/market/listings/{APPID}/{quote(mhn, safe='')}"
                 growth_sign = "+" if item["growth"] >= 0 else ""
@@ -963,6 +1041,7 @@ def main():
                         print(f"[image] Не удалось загрузить фото: {item['image_url']}")
                 media_files.append(('photo', price_buf.getvalue()))
                 media_files.append(('photo', volume_buf.getvalue()))
+                media_files.append(('photo', order_buf.getvalue()))  # График ордеров
 
                 sent = send_media_group_telegram(media_files, caption)
                 
