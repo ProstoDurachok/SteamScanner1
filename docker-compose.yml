@@ -1,0 +1,8 @@
+version: "3.8"
+
+services:
+  mybot:
+    build: .
+    container_name: mybot
+    restart: always
+    working_dir: /app
