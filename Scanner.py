@@ -29,8 +29,8 @@ LOCAL_DB = "items.json"
 APPID = 730
 
 # Telegram
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "8427688497:AAGkBisiTfJM3RDc8DOG9Kx9l9EnekoFGQk")
-CHAT_ID = os.environ.get("CHAT_ID", "-1003143360650")
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "7524644623:AAE6YasVXvYnnNH-xrbSH_odIHEqD_b15oo")
+CHAT_ID = os.environ.get("CHAT_ID", "-1002695033602")
 
 # Steam sessionid
 SESSIONID = os.environ.get("STEAM_SESSIONID", None)
@@ -63,7 +63,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 # Таймзона
 TZ = pytz.timezone("Europe/Moscow")
 EEST_TZ = pytz.timezone("Europe/Tallinn")
-DEFAULT_SUMMARY_TIME = "00:00"
+DEFAULT_SUMMARY_TIME = "02:10"
 
 # SSL
 ALLOW_INSECURE = False
@@ -879,7 +879,7 @@ def main():
                 now_eest = datetime.now(tz=EEST_TZ)
                 target_time = now_eest.replace(hour=summary_time.hour, minute=summary_time.minute, second=0, microsecond=0)
                 time_diff = abs((now_eest - target_time).total_seconds())
-                send_summary = args.send_summary or time_diff <= 300  # Окно ±5 минут
+                send_summary = args.send_summary or time_diff <= 5  # Окно ±5 минут
 
                 if send_summary and items_analyzed:
                     print("[main] Генерация и отправка итогов за 24 часа")
