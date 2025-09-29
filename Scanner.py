@@ -22,6 +22,7 @@ import html
 import io
 from io import BytesIO
 import argparse
+import shutil
 
 # ===================== НАСТРОЙКИ =====================
 BYMYKEL_URL = "https://bymykel.github.io/CSGO-API/api/en/all.json"
@@ -40,12 +41,14 @@ USE_PROXY_BY_DEFAULT = True
 PROXY_HTTP_URL = "http://mm4pkP:a6K4yx@95.181.155.167:8000"
 PROXY_HTTP_ALT = "http://lte6:LVxqnyQiMH@65.109.79.15:13014"
 
-# Поведение запросов
-REQUEST_DELAY = 8.5
-JITTER = 1.5
+# Поведение запросов (увеличено для снижения 429)
+REQUEST_DELAY = 12.0  # Было 8.5
+JITTER = 2.0  # Было 1.5
 MAX_RETRIES = 2
-MAX_RETRIES_429 = 4
+MAX_RETRIES_429 = 3  # Уменьшено, чтобы не затягивать
 BACKOFF_BASE = 2.0
+RATE_LIMIT_PAUSE = 30  # Пауза после 3-х 429 подряд
+RATE_LIMIT_COUNT = 0  # Global счётчик для логов
 
 # Фильтры
 VOLATILITY_THRESHOLD = 8.0
@@ -63,13 +66,14 @@ os.makedirs(OUT_DIR, exist_ok=True)
 # Таймзона
 TZ = pytz.timezone("Europe/Moscow")
 EEST_TZ = pytz.timezone("Europe/Tallinn")
-DEFAULT_SUMMARY_TIME = "02:10"
+DEFAULT_SUMMARY_TIME = "00:00"
 
 # SSL
 ALLOW_INSECURE = False
 
 # Лог
 LOG_FILE = "posted_items.json"
+SUMMARY_LOG = "summary_log.json"
 
 # ===================== ФУНКЦИЯ ПОЛУЧЕНИЯ КУРСА USD/RUB =====================
 def get_usd_to_rub_rate():
@@ -79,10 +83,10 @@ def get_usd_to_rub_rate():
         response.raise_for_status()
         data = response.json()
         usd_rate = data['Valute']['USD']['Value']
-        print(f"[USD_RATE] Актуальный курс USD/RUB: {usd_rate:.2f} (по данным ЦБ РФ)")
+        print(f"[INFO] USD/RUB rate: {usd_rate:.2f}")
         return usd_rate
     except Exception as e:
-        print(f"[USD_RATE] Ошибка при получении курса: {e}. Используется fallback: {USD_RATE}")
+        print(f"[WARN] Failed to fetch USD rate: {e}. Using fallback: {USD_RATE}")
         return USD_RATE  # Fallback на константу
 
 # ===================== Сессия requests =====================
@@ -99,12 +103,16 @@ if SESSIONID:
     session.cookies.set("sessionid", SESSIONID)
 
 def enable_proxy(proxy_url: str):
+    global RATE_LIMIT_COUNT
+    RATE_LIMIT_COUNT = 0  # Reset counter on proxy switch
     session.proxies.update({"http": proxy_url, "https": proxy_url})
-    print("[proxy] включен:", proxy_url)
+    print(f"[INFO] Proxy enabled: {proxy_url}")
 
 def disable_proxy():
+    global RATE_LIMIT_COUNT
+    RATE_LIMIT_COUNT = 0
     session.proxies.clear()
-    print("[proxy] отключён (прямое соединение)")
+    print("[INFO] Proxy disabled (direct connection)")
 
 USE_PROXY = USE_PROXY_BY_DEFAULT
 if USE_PROXY:
@@ -158,67 +166,97 @@ def parse_date(value) -> Optional[datetime]:
                 pass
     return None
 
+# ===================== ЛОГ ПОСЛЕДНЕЙ СВОДКИ =====================
+def load_last_summary() -> Optional[datetime]:
+    if os.path.exists(SUMMARY_LOG):
+        try:
+            with open(SUMMARY_LOG, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return datetime.fromisoformat(data['last_sent'].replace('Z', '+00:00'))
+        except Exception:
+            pass
+    return None
+
+def save_last_summary(dt: datetime):
+    with open(SUMMARY_LOG, "w", encoding="utf-8") as f:
+        json.dump({'last_sent': dt.isoformat()}, f, ensure_ascii=False, indent=2)
+
 # ===================== РЕКВЕСТЫ С RETRY / FALLBACK =====================
 def request_with_retries(url: str, params=None, headers=None, timeout=15, allow_429_backoff=True, force_direct=False):
+    global RATE_LIMIT_COUNT, USE_PROXY
     if force_direct:
         session.proxies.clear()
-        print("[request] Force direct connection for this request")
+        print("[INFO] Force direct for request")
     
     attempt = 0
+    consecutive_429 = 0
     while attempt <= MAX_RETRIES:
         try:
             r = session.get(url, params=params, headers=headers, timeout=timeout)
             if r.status_code == 429 and allow_429_backoff:
+                consecutive_429 += 1
+                RATE_LIMIT_COUNT += 1
+                if RATE_LIMIT_COUNT % 10 == 0:
+                    print(f"[WARN] Total 429 hits: {RATE_LIMIT_COUNT}. Consider slowing down.")
                 attempt_429 = 0
                 while attempt_429 < MAX_RETRIES_429:
                     attempt_429 += 1
                     backoff = BACKOFF_BASE ** attempt_429 + random.random()
-                    print(f"[request] 429 — ждём {backoff:.1f}s (retry429 {attempt_429}/{MAX_RETRIES_429})")
+                    print(f"[WARN] 429 rate limit, waiting {backoff:.1f}s (retry {attempt_429}/{MAX_RETRIES_429})")
                     time.sleep(backoff)
                     r = session.get(url, params=params, headers=headers, timeout=timeout)
                     if r.status_code != 429:
+                        consecutive_429 = 0  # Reset on success
                         break
+                if consecutive_429 >= 3:
+                    print(f"[WARN] 3+ consecutive 429, pausing {RATE_LIMIT_PAUSE}s")
+                    time.sleep(RATE_LIMIT_PAUSE)
+                    consecutive_429 = 0
+                    # Rotate proxy on repeated 429
+                    if USE_PROXY:
+                        print("[INFO] Rotating to alt proxy due to 429")
+                        enable_proxy(PROXY_HTTP_ALT)
+                        USE_PROXY = True  # Keep using alt
+                    else:
+                        print("[INFO] Switching to direct due to 429")
+                        disable_proxy()
             return r
         except (SSLError, ProxyError) as err:
-            print(f"[request] {type(err).__name__}: {err}. Попытка fallback: отключаем прокси и пробуем напрямую.")
+            consecutive_429 = 0  # Not 429
+            print(f"[WARN] Proxy/SSL error: {type(err).__name__}. Rotating proxy.")
             old_proxies = session.proxies.copy()
             try:
-                session.proxies.clear()
-                try:
-                    r = session.get(url, params=params, headers=headers, timeout=timeout)
-                    if r.status_code == 429 and allow_429_backoff:
-                        attempt_429 = 0
-                        while attempt_429 < MAX_RETRIES_429:
-                            attempt_429 += 1
-                            backoff = BACKOFF_BASE ** attempt_429 + random.random()
-                            print(f"[request] 429 (direct) — ждём {backoff:.1f}s (retry429 {attempt_429}/{MAX_RETRIES_429})")
-                            time.sleep(backoff)
-                            r = session.get(url, params=params, headers=headers, timeout=timeout)
-                            if r.status_code != 429:
-                                break
-                    return r
-                except SSLError as ssl2:
-                    print(f"[request] Direct SSLError: {ssl2}")
-                    if ALLOW_INSECURE:
-                        print("[request] ALLOW_INSECURE=True -> пробуем verify=False (unsafe!)")
-                        try:
-                            r = session.get(url, params=params, headers=headers, timeout=timeout, verify=False)
-                            return r
-                        except Exception as e:
-                            print(f"[request] verify=False также упал: {e}")
-                except RequestException as dr:
-                    print(f"[request] Direct request exception: {dr}")
+                if "mm4pkP" in PROXY_HTTP_URL and USE_PROXY:  # If primary, switch to alt
+                    print("[INFO] Switching to alt proxy")
+                    enable_proxy(PROXY_HTTP_ALT)
+                else:
+                    print("[INFO] Falling back to direct")
+                    disable_proxy()
+                r = session.get(url, params=params, headers=headers, timeout=timeout)
+                if r.status_code == 429 and allow_429_backoff:
+                    attempt_429 = 0
+                    while attempt_429 < MAX_RETRIES_429:
+                        attempt_429 += 1
+                        backoff = BACKOFF_BASE ** attempt_429 + random.random()
+                        print(f"[WARN] 429 on rotated, waiting {backoff:.1f}s (retry {attempt_429}/{MAX_RETRIES_429})")
+                        time.sleep(backoff)
+                        r = session.get(url, params=params, headers=headers, timeout=timeout)
+                        if r.status_code != 429:
+                            break
+                return r
+            except Exception as fallback_err:
+                print(f"[WARN] Fallback failed: {fallback_err}")
             finally:
                 session.proxies = old_proxies
             attempt += 1
             backoff = BACKOFF_BASE ** attempt + random.random()
-            print(f"[request] После ошибки: retry {attempt}/{MAX_RETRIES} через {backoff:.1f}s")
+            print(f"[WARN] Retry {attempt}/{MAX_RETRIES} in {backoff:.1f}s")
             time.sleep(backoff)
             continue
         except RequestException as e:
             attempt += 1
             backoff = BACKOFF_BASE ** attempt + random.random()
-            print(f"[request] RequestException: {e}. retry {attempt}/{MAX_RETRIES} через {backoff:.1f}s")
+            print(f"[WARN] Request failed: {e}. Retry {attempt}/{MAX_RETRIES} in {backoff:.1f}s")
             time.sleep(backoff)
             continue
     return None
@@ -226,23 +264,23 @@ def request_with_retries(url: str, params=None, headers=None, timeout=15, allow_
 # ===================== ЗАГРУЗКА ПРЕДМЕТОВ =====================
 def load_items(force_update: bool = False) -> Dict[str, Any]:
     if not os.path.exists(LOCAL_DB) or force_update:
-        print("Скачиваем предметы с ByMykel API...")
+        print("[INFO] Downloading items from ByMykel API...")
         r = session.get(BYMYKEL_URL, timeout=30)
         r.raise_for_status()
         items = r.json()
         try:
             with open(LOCAL_DB, "w", encoding="utf-8") as f:
                 json.dump(items, f, ensure_ascii=False, indent=2)
-            print(f"Сохранено {len(items)} предметов в {LOCAL_DB}")
+            print(f"[INFO] Saved {len(items)} items to {LOCAL_DB}")
         except Exception as e:
-            print(f"[load_items] Ошибка при сохранении JSON: {e}")
+            print(f"[ERROR] Failed to save JSON: {e}")
             raise
     else:
         try:
             with open(LOCAL_DB, "r", encoding="utf-8") as f:
                 items = json.load(f)
         except json.JSONDecodeError as e:
-            print(f"[load_items] Ошибка в JSON: {e}. Загружаем свежие данные.")
+            print(f"[WARN] JSON error in {LOCAL_DB}: {e}. Reloading data.")
             return load_items(force_update=True)
     return items
 
@@ -312,7 +350,7 @@ def get_item_data(market_hash_name: str) -> Dict[str, Any]:
     headers = {"Referer": url}
     r = request_with_retries(url, headers=headers, timeout=20)
     if not r or r.status_code != 200:
-        print(f"[item_data] Не удалось загрузить страницу для {market_hash_name}")
+        print(f"[WARN] Failed to load page for {market_hash_name}")
         return {"history": [], "sell_listings": 0, "buy_orders": 0, "total_listings": 0, "price_usd": 0.0, "image_url": "", "histogram": None}
 
     soup = BeautifulSoup(r.text, "html.parser")
@@ -374,9 +412,10 @@ def get_item_data(market_hash_name: str) -> Dict[str, Any]:
     sell_listings = float(sell_graph[-1][1]) if sell_graph else 0
     buy_orders = float(buy_graph[-1][1]) if buy_graph else 0
 
-    # Fallback к API, если таблицы пустые
+    # Fallback к API, если таблицы пустые (только если item_nameid найден, чтобы не спамить)
+    histogram = None
     if not sell_graph or not buy_graph:
-        print(f"[parse] Таблицы пустые для {market_hash_name}, fallback к API histogram")
+        print(f"[INFO] Empty tables for {market_hash_name}, using API fallback")
         scripts = soup.find_all("script")
         item_nameid = None
         for script in scripts:
@@ -386,8 +425,7 @@ def get_item_data(market_hash_name: str) -> Dict[str, Any]:
                 if m:
                     item_nameid = m.group(1)
                     break
-        histogram = None
-        if item_nameid:
+        if item_nameid:  # Только если нашли ID — запросим
             histogram_url = f"https://steamcommunity.com/market/itemordershistogram?country=RU&language=russian&currency=5&item_nameid={item_nameid}&two_factor=0&norender=1"
             r_hist = request_with_retries(histogram_url, timeout=20)
             if r_hist and r_hist.status_code == 200:
@@ -396,15 +434,11 @@ def get_item_data(market_hash_name: str) -> Dict[str, Any]:
                     buy_orders = j.get('buy_order_count', buy_orders)
                     sell_listings = j.get('sell_order_count', sell_listings)
                     histogram = j
-                    print(f"[parse] Fallback API: buy={buy_orders}, sell={sell_listings}")
+                    print(f"[INFO] API fallback: buy={buy_orders}, sell={sell_listings}")
                 else:
-                    print("[parse] API success=0")
+                    print("[WARN] API success=0")
             else:
-                print("[parse] Failed to load API histogram")
-
-    # Если fallback не сработал, histogram=None
-    if 'buy_order_graph' not in locals() or not locals().get('buy_order_graph'):
-        histogram = locals().get('histogram', None)
+                print("[WARN] Failed API histogram")
     else:
         # Из таблиц
         all_prices = [p for p, c in sell_graph + buy_graph]
@@ -481,7 +515,6 @@ def parse_volume(s):
         return 0
 
 def df_from_pricehistory(prices_raw, usd_rate: float = USD_RATE):
-    print("[df_from_pricehistory] Начало обработки истории цен: всего записей", len(prices_raw))
     rows = []
     now = datetime.now(tz=TZ)
     cutoff_date = now - timedelta(days=HISTORY_DAYS)
@@ -500,28 +533,23 @@ def df_from_pricehistory(prices_raw, usd_rate: float = USD_RATE):
             volume = parse_volume(volume_str)
             dt = pd.to_datetime(date_raw, utc=True, dayfirst=False, errors='coerce')
             if pd.isna(dt):
-                print("[df_from_pricehistory] Неверная дата в записи:", p)
                 continue
             dt = dt.tz_convert('Europe/Moscow')
             if dt < cutoff_date:
                 skipped_old += 1
                 break
             rows.append({"timestamp": dt, "price_usd": price, "volume": volume})
-        except Exception as e:
-            print("[df_from_pricehistory] Ошибка разбора записи истории:", p, "-", e)
+        except Exception:
             continue
     rows.reverse()
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values("timestamp").reset_index(drop=True)
         df["price_rub"] = df["price_usd"] * usd_rate
-    print("[df_from_pricehistory] Сформирован DataFrame с", len(df), "строками (пропущено", skipped_old, "старых записей)")
     return df
 
 def analyze_dataframe(df: pd.DataFrame, current_median: float, current_volume: int):
-    print("[analyze_dataframe] Начало анализа DataFrame: строк=", len(df), ", median=", current_median, ", volume=", current_volume)
     if df.empty or len(df) < 2:
-        print("[analyze_dataframe] DataFrame пустой или слишком мал для анализа. Возвращаю нулевые значения.")
         return {
             "volatility": 0.0,
             "price_growth": 0.0,
@@ -566,7 +594,6 @@ def analyze_dataframe(df: pd.DataFrame, current_median: float, current_volume: i
             range_breakout = ((current_median - max_price_week) / max_price_week * 100)
         elif current_median < lower_bound:
             range_breakout = ((current_median - min_price_week) / min_price_week * 100) * -1
-    print("[analyze_dataframe] Анализ: volatility=", volatility, ", price_growth=", price_growth, ", volume_growth=", volume_growth, ", breakout=", breakout_percentage, ", range_breakout=", range_breakout)
     return {
         "volatility": round(volatility, 2),
         "price_growth": round(price_growth, 2),
@@ -578,30 +605,17 @@ def analyze_dataframe(df: pd.DataFrame, current_median: float, current_volume: i
     }
 
 def item_passes_criteria(item: dict) -> tuple[bool, str]:
-    reason = ""
     if item["price_usd"] < MIN_PRICE:
-        reason = f"price < {MIN_PRICE} ({item['price_usd']})"
-        print("[criteria] Не проходит:", reason)
-        return False, reason
+        return False, f"price < {MIN_PRICE}"
     if item["volume_24h"] < MIN_VOLUME_24H:
-        reason = f"volume_24h < {MIN_VOLUME_24H} ({item['volume_24h']})"
-        print("[criteria] Не проходит:", reason)
-        return False, reason
+        return False, f"volume < {MIN_VOLUME_24H}"
     if item.get("is_sideways", False) and item.get("range_breakout", 0) >= 10.0:
-        reason = f"range_breakout={item['range_breakout']}% >=10% из боковика (range={item.get('range_percent', 0):.1f}%)"
-        print("[criteria] Проходит:", reason)
-        return True, reason
+        return True, "range breakout from sideways"
     if item.get("breakout_percentage", 0) >= BREAKOUT_THRESHOLD:
-        reason = f"breakout_percentage={item['breakout_percentage']} >= {BREAKOUT_THRESHOLD}"
-        print("[criteria] Проходит:", reason)
-        return True, reason
+        return True, "breakout threshold"
     if item.get("volatility", 0) > VOLATILITY_THRESHOLD or abs(item.get("growth", 0)) >= PRICE_CHANGE_THRESHOLD:
-        reason = f"volatility={item['volatility']} > {VOLATILITY_THRESHOLD} or |growth|={abs(item['growth'])} >= {PRICE_CHANGE_THRESHOLD}"
-        print("[criteria] Проходит:", reason)
-        return True, reason
-    reason = f"volatility={item.get('volatility', 0)} <= {VOLATILITY_THRESHOLD} and |growth|={abs(item.get('growth', 0))} < {PRICE_CHANGE_THRESHOLD} and breakout={item.get('breakout_percentage', 0)} < {BREAKOUT_THRESHOLD} and range_breakout={item.get('range_breakout', 0)}<10%"
-    print("[criteria] Не проходит:", reason)
-    return False, reason
+        return True, "volatility or price change"
+    return False, "no criteria met"
 
 def create_empty_buf():
     buf = BytesIO()
@@ -672,16 +686,13 @@ def plot_volume_week(df: pd.DataFrame, title: str):
     return buf
 
 def build_plots(item: dict, days: int = HISTORY_DAYS) -> tuple[BytesIO, BytesIO, BytesIO]:
-    print(f"Построение графиков для предмета: {item['name']} (days={days})")
     df = df_from_pricehistory(item.get("history_raw", []), item.get("usd_rate", USD_RATE))
     price_buf = plot_price_week(df, f"Динамика цены за {days} дней — {item['name']}")
     volume_buf = plot_volume_week(df, f"Объём продаж за {days} дней — {item['name']}")
     histogram = item.get("histogram")
     if not histogram or not histogram.get("buy_order_graph") or not histogram.get("sell_order_graph"):
-        print(f"Нет данных для графика ордеров для {item['name']}. Создаю пустой буфер.")
         order_buf = create_empty_buf()
     else:
-        print(f"Построение графика ордеров для {item['name']}")
         fig_order, ax_order = plt.subplots(figsize=(10, 4))
         fig_order.patch.set_facecolor('#1b2838')
         ax_order.set_facecolor('#1b2838')
@@ -715,8 +726,6 @@ def build_plots(item: dict, days: int = HISTORY_DAYS) -> tuple[BytesIO, BytesIO,
         fig_order.savefig(order_buf, format="png", dpi=120, facecolor='#1b2838', edgecolor='none')
         plt.close(fig_order)
         order_buf.seek(0)
-        print(f"График ордеров создан для {item['name']}")
-    print(f"Графики построены для предмета: {item['name']}")
     return price_buf, volume_buf, order_buf
 
 def send_media_group_telegram(media_files, caption=""):
@@ -736,16 +745,16 @@ def send_media_group_telegram(media_files, caption=""):
         if r.status_code == 200:
             j = r.json()
             if j.get("ok"):
-                print("[telegram/media_group] Отправлено")
+                print("[INFO] Telegram media group sent")
                 return True
             else:
-                print("[telegram/media_group] OK=False:", j)
+                print(f"[WARN] Telegram media OK=False: {j}")
                 return False
         else:
-            print("[telegram/media_group] HTTP", r.status_code, ":", r.text)
+            print(f"[WARN] Telegram media HTTP {r.status_code}: {r.text[:100]}...")
             return False
     except Exception as e:
-        print("[telegram/media_group] Ошибка:", e)
+        print(f"[ERROR] Telegram media error: {e}")
         return False
 
 def send_message_telegram(text: str) -> bool:
@@ -753,9 +762,14 @@ def send_message_telegram(text: str) -> bool:
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}
     try:
         r = session.post(send_url, data=payload, timeout=12)
-        return r.status_code == 200 and r.json().get("ok")
+        if r.status_code == 200 and r.json().get("ok"):
+            print("[INFO] Telegram message sent")
+            return True
+        else:
+            print(f"[WARN] Telegram message failed: {r.status_code}")
+            return False
     except Exception as e:
-        print(f"[telegram] Error: {e}")
+        print(f"[ERROR] Telegram message error: {e}")
         return False
 
 # ===================== ЛОГ ПОСТОВ =====================
@@ -765,6 +779,7 @@ def load_posted_log() -> List[str]:
             with open(LOG_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except:
+            print(f"[WARN] Failed to load {LOG_FILE}, starting empty")
             return []
     return []
 
@@ -800,9 +815,9 @@ def generate_daily_summary(items_analyzed: List[Dict], posted_log: List[str]):
             r_img = request_with_retries(item["image_url"], timeout=10, force_direct=True)
             if r_img and r_img.status_code == 200:
                 growth_media.append(('photo', r_img.content))
-                print(f"[summary] Загружено изображение для {item['market_hash_name']} (рост)")
+                print(f"[INFO] Loaded image for summary growth: {item['market_hash_name']}")
             else:
-                print(f"[summary] Не удалось загрузить изображение для {item['market_hash_name']}: {item['image_url']}")
+                print(f"[WARN] Failed image for summary growth: {item['market_hash_name']}")
     if not top_growth:
         summary_growth += "Нет предметов с ростом цены за последние 24 часа.\n"
 
@@ -819,9 +834,9 @@ def generate_daily_summary(items_analyzed: List[Dict], posted_log: List[str]):
             r_img = request_with_retries(item["image_url"], timeout=10, force_direct=True)
             if r_img and r_img.status_code == 200:
                 decline_media.append(('photo', r_img.content))
-                print(f"[summary] Загружено изображение для {item['market_hash_name']} (падение)")
+                print(f"[INFO] Loaded image for summary decline: {item['market_hash_name']}")
             else:
-                print(f"[summary] Не удалось загрузить изображение для {item['market_hash_name']}: {item['image_url']}")
+                print(f"[WARN] Failed image for summary decline: {item['market_hash_name']}")
     if not top_decline:
         summary_decline += "Нет предметов с падением цены за последние 24 часа.\n"
 
@@ -842,7 +857,7 @@ def main():
     try:
         summary_time = datetime.strptime(args.summary_time, "%H:%M").time()
     except ValueError:
-        print(f"[main] Ошибка: неверный формат времени '{args.summary_time}'. Используется время по умолчанию: {DEFAULT_SUMMARY_TIME}")
+        print(f"[WARN] Invalid time format '{args.summary_time}'. Using default: {DEFAULT_SUMMARY_TIME}")
         summary_time = datetime.strptime(DEFAULT_SUMMARY_TIME, "%H:%M").time()
 
     # Тест прокси
@@ -850,12 +865,11 @@ def main():
         try:
             r = session.get("https://api.ipify.org?format=json", timeout=8)
             ip = r.json().get("ip") if r.status_code == 200 else None
-            print("[proxy] external IP:", ip)
+            print(f"[INFO] Proxy IP: {ip}")
             r2 = session.get("https://steamcommunity.com", timeout=8)
-            print("[steam] main status via proxy:", r2.status_code)
+            print(f"[INFO] Steam status via proxy: {r2.status_code}")
         except Exception as e:
-            print("[proxy] проверка через прокси не удалась:", e)
-            print("[proxy] переключаем на прямое соединение")
+            print(f"[WARN] Proxy test failed: {e}. Switching to direct")
             USE_PROXY = False
             disable_proxy()
     else:
@@ -863,7 +877,7 @@ def main():
 
     items_raw = load_items()
     valid_items = get_valid_items(items_raw)
-    print(f"[main] Загружено {len(valid_items)} валидных предметов.")
+    print(f"[INFO] Loaded {len(valid_items)} valid items")
 
     posted_log = load_posted_log()
     items_analyzed = []
@@ -871,7 +885,7 @@ def main():
     while True:  # Бесконечный цикл
         # Перемешиваем список предметов для случайного порядка
         shuffled_items = random.sample(valid_items, len(valid_items))
-        print(f"[main] Начинаем новый цикл сканирования: {len(shuffled_items)} предметов.")
+        print(f"[INFO] Starting scan cycle: {len(shuffled_items)} items")
 
         for item in shuffled_items:
             try:
@@ -879,60 +893,51 @@ def main():
                 now_eest = datetime.now(tz=EEST_TZ)
                 target_time = now_eest.replace(hour=summary_time.hour, minute=summary_time.minute, second=0, microsecond=0)
                 time_diff = abs((now_eest - target_time).total_seconds())
-                send_summary = args.send_summary or time_diff <= 5  # Окно ±5 минут
+                
+                last_summary = load_last_summary()
+                summary_sent_in_24h = last_summary and (now_eest - last_summary).total_seconds() < 24 * 3600
+                
+                send_summary = (args.send_summary or time_diff <= 60) and not summary_sent_in_24h  # Окно ±1 мин
 
                 if send_summary and items_analyzed:
-                    print("[main] Генерация и отправка итогов за 24 часа")
+                    print("[INFO] Generating and sending 24h summary")
                     (summary_growth, growth_media), (summary_decline, decline_media) = generate_daily_summary(items_analyzed, posted_log)
                     
                     # Отправка топа роста
                     if growth_media:
                         sent_growth = send_media_group_telegram(growth_media, summary_growth)
-                        if sent_growth:
-                            print("[main] Итоги по росту отправлены с изображениями")
-                        else:
-                            print("[main] Не удалось отправить итоги по росту с изображениями, пробуем текст")
+                        if not sent_growth:
                             sent_growth = send_message_telegram(summary_growth)
-                            if sent_growth:
-                                print("[main] Итоги по росту отправлены как текст")
-                            else:
-                                print("[main] Не удалось отправить итоги по росту")
                     else:
                         sent_growth = send_message_telegram(summary_growth)
-                        if sent_growth:
-                            print("[main] Итоги по росту отправлены как текст (нет изображений)")
-                        else:
-                            print("[main] Не удалось отправить итоги по росту")
                     
                     time.sleep(2)
                     
                     # Отправка топа падения
                     if decline_media:
                         sent_decline = send_media_group_telegram(decline_media, summary_decline)
-                        if sent_decline:
-                            print("[main] Итоги по падению отправлены с изображениями")
-                        else:
-                            print("[main] Не удалось отправить итоги по падению с изображениями, пробуем текст")
+                        if not sent_decline:
                             sent_decline = send_message_telegram(summary_decline)
-                            if sent_decline:
-                                print("[main] Итоги по падению отправлены как текст")
-                            else:
-                                print("[main] Не удалось отправить итоги по падению")
                     else:
                         sent_decline = send_message_telegram(summary_decline)
-                        if sent_decline:
-                            print("[main] Итоги по падению отправлены как текст (нет изображений)")
-                        else:
-                            print("[main] Не удалось отправить итоги по падению")
                     
-                    # Очистка лога и списка после успешной отправки итогов
+                    # Если обе сводки отправлены успешно, очищаем всё
                     if sent_growth and sent_decline:
-                        print("[main] Очистка лога опубликованных предметов и списка проанализированных")
+                        print("[INFO] Full cleanup after summary sent")
+                        # Очистка лога опубликованных
                         posted_log = []
-                        items_analyzed = []
                         save_posted_log(posted_log)
+                        # Очистка списка проанализированных
+                        items_analyzed = []
+                        # Сохранение времени отправки сводки
+                        save_last_summary(now_eest)
+                        # Очистка папки с CSV
+                        if os.path.exists(OUT_DIR):
+                            shutil.rmtree(OUT_DIR, ignore_errors=True)
+                        os.makedirs(OUT_DIR, exist_ok=True)
+                        print("[INFO] Cleanup done: logs, analyzed, OUT_DIR")
                     else:
-                        print("[main] Лог не очищен, так как не все итоги были отправлены")
+                        print("[WARN] Partial summary send, no cleanup")
 
                     # Задержка после отправки итогов
                     time.sleep(REQUEST_DELAY + random.random() * JITTER)
@@ -943,20 +948,20 @@ def main():
                 item["market_hash_name"] = mhn
 
                 if mhn in posted_log:
-                    print(f"[main] Пропускаем (уже опубликовано в этом цикле): {mhn}")
+                    print(f"[INFO] Skipping posted: {mhn}")
                     continue
 
-                print(f"\n[main] Загружаем данные: {mhn}")
+                print(f"[INFO] Loading data: {mhn}")
                 time.sleep(REQUEST_DELAY + random.random() * JITTER)
                 data = get_item_data(mhn)
                 raw_history = data["history"]
                 if not raw_history:
-                    print(f"[main] Нет истории для {mhn}")
+                    print(f"[WARN] No history for {mhn}")
                     continue
 
                 df = df_from_pricehistory(raw_history, USD_RATE)
                 if df.empty:
-                    print(f"[main] Не удалось создать DF для {mhn}")
+                    print(f"[WARN] Empty DF for {mhn}")
                     continue
 
                 if not df.empty:
@@ -998,21 +1003,21 @@ def main():
                 item["range_breakout"] = analysis["range_breakout"]
                 item["range_percent"] = analysis["range_percent"]
 
-                print(f"[main] Метрики для {mhn}: объем_24h={item['volume_24h']}, волатильность={item['volatility']:.2f}, рост={item['growth']:.2f}")
-                print(f"[main] Дополнительно: лотов на продажу={item['sell_listings']}, запросов на покупку={item['buy_orders']}, всего лотов={item['total_listings']}")
+                print(f"[INFO] {mhn}: vol_24h={item['volume_24h']}, growth={item['growth']:.1f}%, vol={item['volatility']:.1f}% | sells={item['sell_listings']}, buys={item['buy_orders']}")
 
                 passed, reason = item_passes_criteria(item)
                 if not passed:
-                    print(f"[main] Не прошёл критерии: {mhn} ({reason})")
+                    print(f"[INFO] {mhn} skipped: {reason}")
                     items_analyzed.append(item)
                     continue
 
+                print(f"[INFO] {mhn} passes criteria: {reason}")
                 items_analyzed.append(item)
 
                 safe_name = re.sub(r"[^\w\-_.() ]", "_", mhn)[:120]
                 csv_name = os.path.join(OUT_DIR, f"prices_{safe_name}.csv")
                 df.to_csv(csv_name, index=False, encoding="utf-8")
-                print(f"[main] Сохранён CSV: {csv_name}")
+                print(f"[INFO] Saved CSV: {csv_name}")
 
                 # Построение всех трёх графиков
                 price_buf, volume_buf, order_buf = build_plots(item, HISTORY_DAYS)
@@ -1036,9 +1041,10 @@ def main():
                     r_img = request_with_retries(item["image_url"], timeout=10, force_direct=True)
                     if r_img and r_img.status_code == 200:
                         media_files.append(('photo', r_img.content))
-                        print(f"[image] Загружено фото для {mhn}")
+                        print(f"[INFO] Loaded item image: {mhn}")
                     else:
-                        print(f"[image] Не удалось загрузить фото: {item['image_url']}")
+                        print(f"[WARN] Failed item image: {mhn}")
+
                 media_files.append(('photo', price_buf.getvalue()))
                 media_files.append(('photo', volume_buf.getvalue()))
                 media_files.append(('photo', order_buf.getvalue()))  # График ордеров
@@ -1046,19 +1052,21 @@ def main():
                 sent = send_media_group_telegram(media_files, caption)
                 
                 if sent:
-                    print(f"[main] Успешно запощен: {mhn}")
+                    print(f"[INFO] Posted media: {mhn}")
                     posted_log.append(mhn)
                     save_posted_log(posted_log)
                 else:
-                    print("[main] Отправка медиа не удалась — fallback на текст")
+                    print(f"[WARN] Media failed for {mhn}, trying text")
                     sent_text = send_message_telegram(caption)
                     if sent_text:
-                        print(f"[main] Успешно запощен (текст): {mhn}")
+                        print(f"[INFO] Posted text: {mhn}")
                         posted_log.append(mhn)
                         save_posted_log(posted_log)
+                    else:
+                        print(f"[ERROR] Failed to post {mhn}")
 
             except Exception as e:
-                print(f"[main] Неожиданная ошибка при обработке предмета {mhn}: {e}")
+                print(f"[ERROR] Unexpected error for {mhn if 'mhn' in locals() else 'unknown'}: {e}")
                 time.sleep(REQUEST_DELAY + random.random() * JITTER)
                 continue
 

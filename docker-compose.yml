@@ -6,3 +6,6 @@ services:
     container_name: mybot
     restart: always
     working_dir: /app
+    volumes:
+      - ./:/app
+    command: python Scanner.py
