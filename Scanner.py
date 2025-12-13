@@ -25,7 +25,7 @@ import argparse
 import shutil
 
 # ===================== НАСТРОЙКИ =====================
-BYMYKEL_URL = "https://bymykel.github.io/CSGO-API/api/en/all.json"
+BYMYKEL_URL = "https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/all.json"
 LOCAL_DB = "items.json"
 APPID = 730
 
